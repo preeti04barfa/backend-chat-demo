@@ -84,6 +84,7 @@ io.on("connection", (socket) => {
         name: user.name,
         email: user.email,
         socketId: socket.id,
+        isOnline: user.isOnline
       })
 
       socket.emit("FE-registration-success", {
@@ -727,6 +728,7 @@ socket.on("BE-webrtc-answer", ({ to, answer, callId }) => {
     console.log("User disconnected:", socket.id)
 
     const user = connectedUsers.get(socket.id)
+    
     if (user) {
       // Update user status to offline
       await User.findByIdAndUpdate(user._id, {
