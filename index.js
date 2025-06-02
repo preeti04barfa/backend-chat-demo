@@ -37,7 +37,8 @@ const User = require("./src/models/User")
 
 const connectedUsers = new Map()
 const activeCalls = new Map()
-const callParticipants = new Map() 
+const callParticipants = new Map()
+const callTimeouts = new Map()
 
 const broadcastUserList = async () => {
   try {
@@ -58,6 +59,19 @@ const broadcastUserList = async () => {
     }
   } catch (error) {
     console.error("Error broadcasting user list:", error)
+  }
+}
+
+// broadcast call status changes
+const broadcastCallStatus = (callId, status, groupId = null, callType = null) => {
+  console.log(`Broadcasting call status: ${callId} -> ${status} (${callType})`)
+
+  if (groupId) {
+    // Broadcast to all group members
+    io.emit("FE-call-status-changed", { callId, status, groupId, callType })
+  } else {
+    // Broadcast to call participants
+    io.to(`call_${callId}`).emit("FE-call-status-changed", { callId, status, callType })
   }
 }
 
@@ -321,6 +335,7 @@ io.on("connection", (socket) => {
     }
   })
 
+  // call functionality
   socket.on("BE-initiate-call", async ({ callId, targetUserId, callType, roomId }) => {
     try {
       const currentUser = connectedUsers.get(socket.id)
@@ -428,7 +443,7 @@ io.on("connection", (socket) => {
         participants: [currentUser._id],
       })
 
-    
+      // Initialize call participants
       callParticipants.set(
         callId,
         new Map([
@@ -450,6 +465,32 @@ io.on("connection", (socket) => {
 
       socket.join(`call_${callId}`)
 
+      // 40-second
+      const timeout = setTimeout(() => {
+        const call = activeCalls.get(callId)
+        if (call && call.status === "ringing") {
+          console.log(`Group call ${callId} timed out after 40 seconds`)
+
+          CallHistory.findOneAndUpdate(
+            { callId },
+            {
+              status: "missed",
+              endTime: new Date(),
+            },
+          ).catch(console.error)
+
+          activeCalls.delete(callId)
+          callParticipants.delete(callId)
+          callTimeouts.delete(callId)
+
+          broadcastCallStatus(callId, "ended", groupId, callType)
+          io.to(`call_${callId}`).emit("FE-call-ended", { callId, groupId })
+        }
+      }, 40000) 
+
+      callTimeouts.set(callId, timeout)
+
+      // Send ringing notification
       group.members.forEach((member) => {
         const memberUser = Array.from(connectedUsers.values()).find((u) => u._id === member._id.toString())
         if (memberUser && memberUser._id !== currentUser._id) {
@@ -457,6 +498,7 @@ io.on("connection", (socket) => {
             callId,
             caller: currentUser,
             groupName: group.name,
+            groupId: groupId,
             callType,
             isGroupCall: true,
             status: "ringing",
@@ -481,7 +523,12 @@ io.on("connection", (socket) => {
         return
       }
 
-      call.status = "connected"
+      if (callTimeouts.has(callId)) {
+        clearTimeout(callTimeouts.get(callId))
+        callTimeouts.delete(callId)
+      }
+
+      call.status = call.isGroupCall ? "active" : "connected"
       call.acceptTime = new Date()
 
       if (call.isGroupCall) {
@@ -521,6 +568,7 @@ io.on("connection", (socket) => {
           },
         )
 
+        // Notify all participants about the new user joining
         socket.to(`call_${callId}`).emit("FE-user-joined-call", {
           userId: currentUser._id,
           userInfo: {
@@ -529,6 +577,9 @@ io.on("connection", (socket) => {
             email: currentUser.email,
           },
         })
+
+        // Broadcast that call is now active stops ringing for others
+        broadcastCallStatus(callId, "active", call.groupId, call.callType)
 
         const callerUser = Array.from(connectedUsers.values()).find((u) => u._id === call.caller._id)
         if (callerUser) {
@@ -569,6 +620,67 @@ io.on("connection", (socket) => {
     }
   })
 
+  //joining active group calls
+  socket.on("BE-join-active-call", async ({ callId, groupId, callType }) => {
+    try {
+      const currentUser = connectedUsers.get(socket.id)
+      if (!currentUser) return
+
+      const call = activeCalls.get(callId)
+      if (!call || call.status !== "active") {
+        socket.emit("FE-error", { message: "Call not found or not active" })
+        return
+      }
+
+      // Add user to call participants
+      if (!call.participants.includes(currentUser._id)) {
+        call.participants.push(currentUser._id)
+      }
+
+      activeCalls.set(callId, call)
+
+      // Add to call participants with detailed info
+      if (!callParticipants.has(callId)) {
+        callParticipants.set(callId, new Map())
+      }
+
+      callParticipants.get(callId).set(currentUser._id, {
+        userId: currentUser._id,
+        userInfo: {
+          id: currentUser._id,
+          name: currentUser.name,
+          email: currentUser.email,
+        },
+        socketId: socket.id,
+        joinedAt: new Date(),
+      })
+
+      socket.join(`call_${callId}`)
+
+      // Update call history
+      await CallHistory.findOneAndUpdate(
+        { callId },
+        {
+          $addToSet: { participants: currentUser._id },
+        },
+      )
+
+      // Notify all participants about the new user joining
+      socket.to(`call_${callId}`).emit("FE-user-joined-call", {
+        userId: currentUser._id,
+        userInfo: {
+          id: currentUser._id,
+          name: currentUser.name,
+          email: currentUser.email,
+        },
+      })
+
+      console.log(`User ${currentUser.name} joined active group call ${callId}`)
+    } catch (error) {
+      console.error("Join active call error:", error)
+    }
+  })
+
   socket.on("BE-reject-call", async ({ callId, reason }) => {
     try {
       const currentUser = connectedUsers.get(socket.id)
@@ -596,7 +708,13 @@ io.on("connection", (socket) => {
           })
         }
       } else {
+        // For one-to-one calls, end the call
         activeCalls.delete(callId)
+
+        if (callTimeouts.has(callId)) {
+          clearTimeout(callTimeouts.get(callId))
+          callTimeouts.delete(callId)
+        }
 
         const callerUser = Array.from(connectedUsers.values()).find((u) => u._id === call.caller._id)
         if (callerUser) {
@@ -623,9 +741,16 @@ io.on("connection", (socket) => {
       const call = activeCalls.get(callId)
       if (!call) return
 
+      // Calculate call duration
       const endTime = new Date()
       const duration = call.acceptTime ? Math.floor((endTime - call.acceptTime) / 1000) : 0
 
+      if (callTimeouts.has(callId)) {
+        clearTimeout(callTimeouts.get(callId))
+        callTimeouts.delete(callId)
+      }
+
+      // Update call history
       await CallHistory.findOneAndUpdate(
         { callId },
         {
@@ -638,9 +763,16 @@ io.on("connection", (socket) => {
       activeCalls.delete(callId)
       callParticipants.delete(callId)
 
-      io.to(`call_${callId}`).emit("FE-call-ended", { callId })
+      // Notify all participants
+      io.to(`call_${callId}`).emit("FE-call-ended", { callId, groupId: call.groupId })
+
+      // Broadcast call ended status
+      if (call.groupId) {
+        broadcastCallStatus(callId, "ended", call.groupId, call.callType)
+      }
 
       if (!call.isGroupCall) {
+        // For one-to-one calls, notify both parties
         const callerUser = Array.from(connectedUsers.values()).find((u) => u._id === call.caller._id)
         const receiverUser = Array.from(connectedUsers.values()).find((u) => u._id === call.receiver._id)
 
@@ -655,6 +787,67 @@ io.on("connection", (socket) => {
       console.log(`Call ended: ${callId}, duration: ${duration}s`)
     } catch (error) {
       console.error("End call error:", error)
+    }
+  })
+
+  // individual leaving from group call
+  socket.on("BE-leave-call", ({ callId, userId }) => {
+    try {
+      const currentUser = connectedUsers.get(socket.id)
+      if (!currentUser) return
+
+      const call = activeCalls.get(callId)
+      if (!call) return
+
+      console.log(`User ${userId} leaving call ${callId}`)
+
+      socket.leave(`call_${callId}`)
+      socket.to(`call_${callId}`).emit("FE-user-left-call", { userId })
+
+      if (callParticipants.has(callId)) {
+        callParticipants.get(callId).delete(userId)
+        console.log(`Removed ${userId} from call participants. Remaining: ${callParticipants.get(callId).size}`)
+      }
+
+      if (call.participants) {
+        call.participants = call.participants.filter((id) => id !== userId)
+
+        // If no part.. end the call completely
+        if (call.participants.length === 0) {
+          console.log(`No participants left in call ${callId}, ending call`)
+
+          const endTime = new Date()
+          const duration = call.acceptTime ? Math.floor((endTime - call.acceptTime) / 1000) : 0
+
+          if (callTimeouts.has(callId)) {
+            clearTimeout(callTimeouts.get(callId))
+            callTimeouts.delete(callId)
+          }
+
+          CallHistory.findOneAndUpdate(
+            { callId },
+            {
+              status: "completed",
+              endTime,
+              duration,
+            },
+          ).catch(console.error)
+
+          activeCalls.delete(callId)
+          callParticipants.delete(callId)
+
+          // Broadcast call ended status
+          if (call.groupId) {
+            broadcastCallStatus(callId, "ended", call.groupId, call.callType)
+          }
+
+          io.to(`call_${callId}`).emit("FE-call-ended", { callId, groupId: call.groupId })
+        } else {
+          activeCalls.set(callId, call)
+        }
+      }
+    } catch (error) {
+      console.error("Leave call error:", error)
     }
   })
 
@@ -689,6 +882,7 @@ io.on("connection", (socket) => {
         participant.socketId = socket.id
         participant.rejoinedAt = new Date()
       }
+
       socket.to(`call_${callId}`).emit("FE-user-joined-call", {
         userId,
         userInfo: userInfo || { id: userId, name: "User" },
@@ -702,6 +896,7 @@ io.on("connection", (socket) => {
         activeCalls.set(callId, call)
       }
     } else {
+      // For one-to-one calls, just notify the other participant
       socket.to(`call_${callId}`).emit("FE-user-joined-call", {
         userId,
         userInfo: userInfo || { id: userId, name: "User" },
@@ -709,12 +904,14 @@ io.on("connection", (socket) => {
     }
   })
 
+  // get existing participants for group calls
   socket.on("BE-get-call-participants", ({ callId }) => {
     console.log(`Getting participants for call ${callId}`)
 
     const participants = callParticipants.get(callId)
     if (participants) {
       const participantsList = Array.from(participants.values()).filter((p) => {
+        // Only include participants that are still connected
         const user = Array.from(connectedUsers.values()).find((u) => u._id === p.userId)
         return user && user.socketId
       })
@@ -730,24 +927,6 @@ io.on("connection", (socket) => {
     } else {
       console.log(`No participants found for call ${callId}`)
       socket.emit("FE-existing-participants", { participants: [] })
-    }
-  })
-
-  socket.on("BE-leave-call", ({ callId, userId }) => {
-    console.log(`User ${userId} leaving call ${callId}`)
-
-    socket.leave(`call_${callId}`)
-    socket.to(`call_${callId}`).emit("FE-user-left-call", { userId })
-
-    if (callParticipants.has(callId)) {
-      callParticipants.get(callId).delete(userId)
-      console.log(`Removed ${userId} from call participants. Remaining: ${callParticipants.get(callId).size}`)
-    }
-
-    const call = activeCalls.get(callId)
-    if (call && call.participants) {
-      call.participants = call.participants.filter((id) => id !== userId)
-      activeCalls.set(callId, call)
     }
   })
 
@@ -832,6 +1011,7 @@ io.on("connection", (socket) => {
     }
   })
 
+  // Get call history for specific chat
   socket.on("BE-get-chat-call-history", async ({ roomId, isGroupChat, targetUserId, groupId }) => {
     try {
       const currentUser = connectedUsers.get(socket.id)
@@ -840,6 +1020,7 @@ io.on("connection", (socket) => {
       let callHistory = []
 
       if (isGroupChat && groupId) {
+        // Get group call history
         callHistory = await CallHistory.find({
           groupId: groupId,
           isGroupCall: true,
@@ -849,6 +1030,7 @@ io.on("connection", (socket) => {
           .sort({ startTime: -1 })
           .limit(20)
       } else if (targetUserId) {
+        // Get private call history between current user and target user
         callHistory = await CallHistory.find({
           $and: [
             { isGroupCall: false },
@@ -872,6 +1054,7 @@ io.on("connection", (socket) => {
     }
   })
 
+  // Get call history
   socket.on("BE-get-call-history", async () => {
     try {
       const currentUser = connectedUsers.get(socket.id)
@@ -898,12 +1081,14 @@ io.on("connection", (socket) => {
     const user = connectedUsers.get(socket.id)
 
     if (user) {
+      // Update user offline
       await User.findByIdAndUpdate(user._id, {
         isOnline: false,
         lastSeen: new Date(),
         socketId: null,
       })
 
+      // active calls
       for (const [callId, call] of activeCalls.entries()) {
         if (
           call.caller._id === user._id ||
@@ -917,7 +1102,12 @@ io.on("connection", (socket) => {
               callParticipants.get(callId).delete(user._id)
             }
 
-            if (call.participants.length <= 1) {
+            if (call.participants.length === 0) {
+              if (callTimeouts.has(callId)) {
+                clearTimeout(callTimeouts.get(callId))
+                callTimeouts.delete(callId)
+              }
+
               await CallHistory.findOneAndUpdate(
                 { callId },
                 {
@@ -927,12 +1117,23 @@ io.on("connection", (socket) => {
               )
               activeCalls.delete(callId)
               callParticipants.delete(callId)
-              io.to(`call_${callId}`).emit("FE-call-ended", { callId })
+
+              if (call.groupId) {
+                broadcastCallStatus(callId, "ended", call.groupId, call.callType)
+              }
+
+              io.to(`call_${callId}`).emit("FE-call-ended", { callId, groupId: call.groupId })
             } else {
               activeCalls.set(callId, call)
               io.to(`call_${callId}`).emit("FE-user-left-call", { userId: user._id })
             }
           } else {
+            // For one-to-one calls, end the call
+            if (callTimeouts.has(callId)) {
+              clearTimeout(callTimeouts.get(callId))
+              callTimeouts.delete(callId)
+            }
+
             await CallHistory.findOneAndUpdate(
               { callId },
               {
