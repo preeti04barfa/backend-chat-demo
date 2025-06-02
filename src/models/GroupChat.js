@@ -5,8 +5,6 @@ const groupChatSchema = new mongoose.Schema(
     groupId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Group",
-      required: true,
-      index: true,
     },
     sender: {
       type: mongoose.Schema.Types.ObjectId,
