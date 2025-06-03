@@ -5,8 +5,6 @@ const callHistorySchema = new mongoose.Schema(
     callId: {
       type: String,
       required: true,
-      unique: true,
-      index: true,
     },
     caller: {
       type: mongoose.Schema.Types.ObjectId,

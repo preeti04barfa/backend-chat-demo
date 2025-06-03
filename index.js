@@ -7,7 +7,6 @@ require("dotenv").config()
 const app = express()
 const server = http.createServer(app)
 
-
 app.use(
   cors({
     origin: "*",
@@ -24,6 +23,8 @@ const io = socketIo(server, {
     methods: ["GET", "POST"],
     credentials: true,
   },
+  pingTimeout: 60000,
+  pingInterval: 25000,
 })
 
 const dbConnection = require("./src/config/Db.config")
@@ -37,6 +38,8 @@ const User = require("./src/models/User")
 const connectedUsers = new Map()
 const activeCalls = new Map()
 const callParticipants = new Map()
+const callTimeouts = new Map()
+
 const broadcastUserList = async () => {
   try {
     const allUsers = await User.find({}).select("name email isOnline lastSeen").lean()
@@ -59,11 +62,23 @@ const broadcastUserList = async () => {
   }
 }
 
+// broadcast call status changes
+const broadcastCallStatus = (callId, status, groupId = null, callType = null) => {
+  console.log(`Broadcasting call status: ${callId} -> ${status} (${callType})`)
 
-
+  if (groupId) {
+    // Broadcast to all group members
+    io.emit("FE-call-status-changed", { callId, status, groupId, callType })
+  } else {
+    // Broadcast to call participants
+    io.to(`call_${callId}`).emit("FE-call-status-changed", { callId, status, callType })
+  }
+}
 
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id)
+
+  socket.conn.setMaxListeners(50)
 
   socket.on("BE-register-user", async ({ name, email }) => {
     try {
@@ -84,6 +99,7 @@ io.on("connection", (socket) => {
         name: user.name,
         email: user.email,
         socketId: socket.id,
+        isOnline: user.isOnline,
       })
 
       socket.emit("FE-registration-success", {
@@ -208,6 +224,8 @@ io.on("connection", (socket) => {
       const currentUser = connectedUsers.get(socket.id)
       if (!currentUser) return
 
+      console.log("Creating group:", { name, members, creator: currentUser._id })
+
       const group = new Group({
         name,
         creator: currentUser._id,
@@ -218,9 +236,33 @@ io.on("connection", (socket) => {
       await group.populate("creator", "name email")
       await group.populate("members", "name email")
 
+      console.log("Group created successfully:", group)
+
       socket.emit("FE-group-created", { group })
+
+      const allMemberIds = group.members.map((member) => member._id.toString())
+
+      for (const memberId of allMemberIds) {
+        if (memberId === currentUser._id) continue
+
+        const memberSocket = Array.from(connectedUsers.values()).find((user) => user._id === memberId)
+
+        if (memberSocket) {
+          console.log(`Sending group update to member: ${memberSocket.name} (${memberSocket.socketId})`)
+
+          const memberGroups = await Group.find({ members: memberId })
+            .populate("creator", "name email")
+            .populate("members", "name email")
+
+          io.to(memberSocket.socketId).emit("FE-group-list", memberGroups)
+          io.to(memberSocket.socketId).emit("FE-group-created", { group })
+        }
+      }
+
+      console.log("Group creation and real-time updates completed")
     } catch (error) {
       console.error("Create group error:", error)
+      socket.emit("FE-error", { message: "Failed to create group: " + error.message })
     }
   })
 
@@ -293,7 +335,7 @@ io.on("connection", (socket) => {
     }
   })
 
-  // Call functionality
+  // call functionality
   socket.on("BE-initiate-call", async ({ callId, targetUserId, callType, roomId }) => {
     try {
       const currentUser = connectedUsers.get(socket.id)
@@ -305,7 +347,22 @@ io.on("connection", (socket) => {
         return
       }
 
-      // Create call history record
+      const existingCall = Array.from(activeCalls.values()).find(
+        (call) =>
+          call.participants &&
+          (call.participants.includes(targetUserId) ||
+            call.caller._id === targetUserId ||
+            call.receiver?._id === targetUserId),
+      )
+
+      if (existingCall) {
+        return socket.emit("FE-call-engaged", {
+          callId,
+          userId: targetUserId,
+          userName: targetUser.name,
+        })
+      }
+
       const callHistory = new CallHistory({
         callId,
         caller: currentUser._id,
@@ -317,7 +374,6 @@ io.on("connection", (socket) => {
       })
       await callHistory.save()
 
-      // Store active call
       activeCalls.set(callId, {
         callId,
         caller: currentUser,
@@ -330,9 +386,9 @@ io.on("connection", (socket) => {
         status: "ringing",
         startTime: new Date(),
         isGroupCall: false,
+        participants: [currentUser._id, targetUserId],
       })
 
-      // Send call notification to receiver if online
       if (targetUserSocket) {
         io.to(targetUserSocket.socketId).emit("FE-incoming-call", {
           callId,
@@ -363,7 +419,6 @@ io.on("connection", (socket) => {
       const group = await Group.findById(groupId).populate("members", "name email")
       if (!group) return
 
-      // Create call history record
       const callHistory = new CallHistory({
         callId,
         caller: currentUser._id,
@@ -372,11 +427,10 @@ io.on("connection", (socket) => {
         status: "ringing",
         startTime: new Date(),
         isGroupCall: true,
-        participants: group.members.map((m) => m._id),
+        participants: [currentUser._id],
       })
       await callHistory.save()
 
-      // Store active call
       activeCalls.set(callId, {
         callId,
         caller: currentUser,
@@ -386,10 +440,57 @@ io.on("connection", (socket) => {
         status: "ringing",
         startTime: new Date(),
         isGroupCall: true,
-        participants: [],
+        participants: [currentUser._id],
       })
 
-      // Send call notification to all group members except caller
+      // Initialize call participants
+      callParticipants.set(
+        callId,
+        new Map([
+          [
+            currentUser._id,
+            {
+              userId: currentUser._id,
+              userInfo: {
+                id: currentUser._id,
+                name: currentUser.name,
+                email: currentUser.email,
+              },
+              socketId: socket.id,
+              joinedAt: new Date(),
+            },
+          ],
+        ]),
+      )
+
+      socket.join(`call_${callId}`)
+
+      // 40-second
+      const timeout = setTimeout(() => {
+        const call = activeCalls.get(callId)
+        if (call && call.status === "ringing") {
+          console.log(`Group call ${callId} timed out after 40 seconds`)
+
+          CallHistory.findOneAndUpdate(
+            { callId },
+            {
+              status: "missed",
+              endTime: new Date(),
+            },
+          ).catch(console.error)
+
+          activeCalls.delete(callId)
+          callParticipants.delete(callId)
+          callTimeouts.delete(callId)
+
+          broadcastCallStatus(callId, "ended", groupId, callType)
+          io.to(`call_${callId}`).emit("FE-call-ended", { callId, groupId })
+        }
+      }, 40000) 
+
+      callTimeouts.set(callId, timeout)
+
+      // Send ringing notification
       group.members.forEach((member) => {
         const memberUser = Array.from(connectedUsers.values()).find((u) => u._id === member._id.toString())
         if (memberUser && memberUser._id !== currentUser._id) {
@@ -397,6 +498,7 @@ io.on("connection", (socket) => {
             callId,
             caller: currentUser,
             groupName: group.name,
+            groupId: groupId,
             callType,
             isGroupCall: true,
             status: "ringing",
@@ -421,38 +523,64 @@ io.on("connection", (socket) => {
         return
       }
 
-      // Update call status
-      call.status = "connected"
-      call.acceptTime = new Date()
-      activeCalls.set(callId, call)
+      if (callTimeouts.has(callId)) {
+        clearTimeout(callTimeouts.get(callId))
+        callTimeouts.delete(callId)
+      }
 
-      // Update call history
-      await CallHistory.findOneAndUpdate(
-        { callId },
-        {
-          status: "accepted",
-          acceptTime: new Date(),
-          $addToSet: { participants: currentUser._id },
-        },
-      )
+      call.status = call.isGroupCall ? "active" : "connected"
+      call.acceptTime = new Date()
 
       if (call.isGroupCall) {
-        // Add user to call participants
-        if (!callParticipants.has(callId)) {
-          callParticipants.set(callId, new Set())
+        if (!call.participants) {
+          call.participants = [call.caller._id]
         }
-        callParticipants.get(callId).add(currentUser._id)
 
-        // Join call room
-        socket.join(`call_${callId}`)
+        if (!call.participants.includes(currentUser._id)) {
+          call.participants.push(currentUser._id)
+        }
 
-        // Notify caller and other participants
-        socket.to(`call_${callId}`).emit("FE-user-joined-call", {
+        activeCalls.set(callId, call)
+
+        if (!callParticipants.has(callId)) {
+          callParticipants.set(callId, new Map())
+        }
+
+        callParticipants.get(callId).set(currentUser._id, {
           userId: currentUser._id,
-          userInfo: currentUser,
+          userInfo: {
+            id: currentUser._id,
+            name: currentUser.name,
+            email: currentUser.email,
+          },
+          socketId: socket.id,
+          joinedAt: new Date(),
         })
 
-        // Notify caller about acceptance
+        socket.join(`call_${callId}`)
+
+        await CallHistory.findOneAndUpdate(
+          { callId },
+          {
+            status: "accepted",
+            acceptTime: new Date(),
+            $addToSet: { participants: currentUser._id },
+          },
+        )
+
+        // Notify all participants about the new user joining
+        socket.to(`call_${callId}`).emit("FE-user-joined-call", {
+          userId: currentUser._id,
+          userInfo: {
+            id: currentUser._id,
+            name: currentUser.name,
+            email: currentUser.email,
+          },
+        })
+
+        // Broadcast that call is now active stops ringing for others
+        broadcastCallStatus(callId, "active", call.groupId, call.callType)
+
         const callerUser = Array.from(connectedUsers.values()).find((u) => u._id === call.caller._id)
         if (callerUser) {
           io.to(callerUser.socketId).emit("FE-call-accepted", {
@@ -461,11 +589,21 @@ io.on("connection", (socket) => {
             isGroupCall: true,
           })
         }
+
+        console.log(`Group call accepted: ${currentUser.name} joined call ${callId}`)
       } else {
-        // One-to-one call
+        activeCalls.set(callId, call)
+
         socket.join(`call_${callId}`)
 
-        // Notify caller
+        await CallHistory.findOneAndUpdate(
+          { callId },
+          {
+            status: "accepted",
+            acceptTime: new Date(),
+          },
+        )
+
         const callerUser = Array.from(connectedUsers.values()).find((u) => u._id === call.caller._id)
         if (callerUser) {
           io.to(callerUser.socketId).emit("FE-call-accepted", {
@@ -474,15 +612,76 @@ io.on("connection", (socket) => {
             isGroupCall: false,
           })
         }
-      }
 
-      console.log(`Call accepted: ${currentUser.name} accepted call ${callId}`)
+        console.log(`Call accepted: ${currentUser.name} accepted call ${callId}`)
+      }
     } catch (error) {
       console.error("Accept call error:", error)
     }
   })
 
-  socket.on("BE-reject-call", async ({ callId }) => {
+  //joining active group calls
+  socket.on("BE-join-active-call", async ({ callId, groupId, callType }) => {
+    try {
+      const currentUser = connectedUsers.get(socket.id)
+      if (!currentUser) return
+
+      const call = activeCalls.get(callId)
+      if (!call || call.status !== "active") {
+        socket.emit("FE-error", { message: "Call not found or not active" })
+        return
+      }
+
+      // Add user to call participants
+      if (!call.participants.includes(currentUser._id)) {
+        call.participants.push(currentUser._id)
+      }
+
+      activeCalls.set(callId, call)
+
+      // Add to call participants with detailed info
+      if (!callParticipants.has(callId)) {
+        callParticipants.set(callId, new Map())
+      }
+
+      callParticipants.get(callId).set(currentUser._id, {
+        userId: currentUser._id,
+        userInfo: {
+          id: currentUser._id,
+          name: currentUser.name,
+          email: currentUser.email,
+        },
+        socketId: socket.id,
+        joinedAt: new Date(),
+      })
+
+      socket.join(`call_${callId}`)
+
+      // Update call history
+      await CallHistory.findOneAndUpdate(
+        { callId },
+        {
+          $addToSet: { participants: currentUser._id },
+        },
+      )
+
+      // Notify all participants about the new user joining
+      socket.to(`call_${callId}`).emit("FE-user-joined-call", {
+        userId: currentUser._id,
+        userInfo: {
+          id: currentUser._id,
+          name: currentUser.name,
+          email: currentUser.email,
+        },
+      })
+
+      console.log(`User ${currentUser.name} joined active group call ${callId}`)
+    } catch (error) {
+      console.error("Join active call error:", error)
+    }
+  })
+
+  socket.on("BE-reject-call", async ({ callId, reason }) => {
     try {
       const currentUser = connectedUsers.get(socket.id)
       if (!currentUser) return
@@ -490,36 +689,40 @@ io.on("connection", (socket) => {
       const call = activeCalls.get(callId)
       if (!call) return
 
-      // Update call history
       await CallHistory.findOneAndUpdate(
         { callId },
         {
-          status: "rejected",
+          status: reason === "busy" ? "missed" : "rejected",
           endTime: new Date(),
         },
       )
 
       if (call.isGroupCall) {
-        // For group calls, just notify that this user rejected
         const callerUser = Array.from(connectedUsers.values()).find((u) => u._id === call.caller._id)
         if (callerUser) {
           io.to(callerUser.socketId).emit("FE-call-rejected", {
             callId,
             rejectedBy: currentUser,
             isGroupCall: true,
+            reason,
           })
         }
       } else {
         // For one-to-one calls, end the call
         activeCalls.delete(callId)
 
-        // Notify caller
+        if (callTimeouts.has(callId)) {
+          clearTimeout(callTimeouts.get(callId))
+          callTimeouts.delete(callId)
+        }
+
         const callerUser = Array.from(connectedUsers.values()).find((u) => u._id === call.caller._id)
         if (callerUser) {
           io.to(callerUser.socketId).emit("FE-call-rejected", {
             callId,
             rejectedBy: currentUser,
             isGroupCall: false,
+            reason,
           })
         }
       }
@@ -542,6 +745,11 @@ io.on("connection", (socket) => {
       const endTime = new Date()
       const duration = call.acceptTime ? Math.floor((endTime - call.acceptTime) / 1000) : 0
 
+      if (callTimeouts.has(callId)) {
+        clearTimeout(callTimeouts.get(callId))
+        callTimeouts.delete(callId)
+      }
+
       // Update call history
       await CallHistory.findOneAndUpdate(
         { callId },
@@ -552,12 +760,16 @@ io.on("connection", (socket) => {
         },
       )
 
-      // Clean up
       activeCalls.delete(callId)
       callParticipants.delete(callId)
 
       // Notify all participants
-      io.to(`call_${callId}`).emit("FE-call-ended", { callId })
+      io.to(`call_${callId}`).emit("FE-call-ended", { callId, groupId: call.groupId })
+
+      // Broadcast call ended status
+      if (call.groupId) {
+        broadcastCallStatus(callId, "ended", call.groupId, call.callType)
+      }
 
       if (!call.isGroupCall) {
         // For one-to-one calls, notify both parties
@@ -578,85 +790,226 @@ io.on("connection", (socket) => {
     }
   })
 
-  // WebRTC signaling
-  socket.on("BE-join-call", ({ callId, userId, userInfo }) => {
-    socket.join(`call_${callId}`)
-    socket.to(`call_${callId}`).emit("FE-user-joined-call", { userId, userInfo })
-  })
-
+  // individual leaving from group call
   socket.on("BE-leave-call", ({ callId, userId }) => {
-    socket.leave(`call_${callId}`)
-    socket.to(`call_${callId}`).emit("FE-user-left-call", { userId })
-  })
-socket.on("BE-webrtc-offer", ({ to, offer, callId }) => {
-  try {
-    const currentUser = connectedUsers.get(socket.id)
-    const targetUser = Array.from(connectedUsers.values()).find((u) => u._id === to)
+    try {
+      const currentUser = connectedUsers.get(socket.id)
+      if (!currentUser) return
 
-    if (targetUser && currentUser) {
-      console.log(`Forwarding WebRTC offer from ${currentUser.name} to ${targetUser.name}`)
-      io.to(targetUser.socketId).emit("FE-webrtc-offer", {
-        from: currentUser._id,
-        offer,
-        callId,
+      const call = activeCalls.get(callId)
+      if (!call) return
+
+      console.log(`User ${userId} leaving call ${callId}`)
+
+      socket.leave(`call_${callId}`)
+      socket.to(`call_${callId}`).emit("FE-user-left-call", { userId })
+
+      if (callParticipants.has(callId)) {
+        callParticipants.get(callId).delete(userId)
+        console.log(`Removed ${userId} from call participants. Remaining: ${callParticipants.get(callId).size}`)
+      }
+
+      if (call.participants) {
+        call.participants = call.participants.filter((id) => id !== userId)
+
+        // If no part.. end the call completely
+        if (call.participants.length === 0) {
+          console.log(`No participants left in call ${callId}, ending call`)
+
+          const endTime = new Date()
+          const duration = call.acceptTime ? Math.floor((endTime - call.acceptTime) / 1000) : 0
+
+          if (callTimeouts.has(callId)) {
+            clearTimeout(callTimeouts.get(callId))
+            callTimeouts.delete(callId)
+          }
+
+          CallHistory.findOneAndUpdate(
+            { callId },
+            {
+              status: "completed",
+              endTime,
+              duration,
+            },
+          ).catch(console.error)
+
+          activeCalls.delete(callId)
+          callParticipants.delete(callId)
+
+          // Broadcast call ended status
+          if (call.groupId) {
+            broadcastCallStatus(callId, "ended", call.groupId, call.callType)
+          }
+
+          io.to(`call_${callId}`).emit("FE-call-ended", { callId, groupId: call.groupId })
+        } else {
+          activeCalls.set(callId, call)
+        }
+      }
+    } catch (error) {
+      console.error("Leave call error:", error)
+    }
+  })
+
+  // WebRTC signaling for group calls
+  socket.on("BE-join-call", ({ callId, userId, userInfo }) => {
+    console.log(`User ${userId} joining call ${callId}`, userInfo)
+
+    socket.join(`call_${callId}`)
+
+    const call = activeCalls.get(callId)
+    if (!call) {
+      console.error(`Call ${callId} not found`)
+      return
+    }
+
+    if (call.isGroupCall) {
+      if (!callParticipants.has(callId)) {
+        callParticipants.set(callId, new Map())
+      }
+
+      if (!callParticipants.get(callId).has(userId)) {
+        callParticipants.get(callId).set(userId, {
+          userId,
+          userInfo: userInfo || { id: userId, name: "User" },
+          socketId: socket.id,
+          joinedAt: new Date(),
+        })
+
+        console.log(`Added ${userId} to call participants. Total participants: ${callParticipants.get(callId).size}`)
+      } else {
+        const participant = callParticipants.get(callId).get(userId)
+        participant.socketId = socket.id
+        participant.rejoinedAt = new Date()
+      }
+
+      socket.to(`call_${callId}`).emit("FE-user-joined-call", {
+        userId,
+        userInfo: userInfo || { id: userId, name: "User" },
+      })
+
+      if (!call.participants) {
+        call.participants = []
+      }
+      if (!call.participants.includes(userId)) {
+        call.participants.push(userId)
+        activeCalls.set(callId, call)
+      }
+    } else {
+      // For one-to-one calls, just notify the other participant
+      socket.to(`call_${callId}`).emit("FE-user-joined-call", {
+        userId,
+        userInfo: userInfo || { id: userId, name: "User" },
       })
     }
-  } catch (error) {
-    console.error("WebRTC offer forwarding error:", error)
-  }
-})
+  })
+
+  // get existing participants for group calls
+  socket.on("BE-get-call-participants", ({ callId }) => {
+    console.log(`Getting participants for call ${callId}`)
+
+    const participants = callParticipants.get(callId)
+    if (participants) {
+      const participantsList = Array.from(participants.values()).filter((p) => {
+        // Only include participants that are still connected
+        const user = Array.from(connectedUsers.values()).find((u) => u._id === p.userId)
+        return user && user.socketId
+      })
+
+      console.log(
+        `Sending ${participantsList.length} existing participants for call ${callId}:`,
+        participantsList.map((p) => p.userInfo.name || p.userId),
+      )
+
+      socket.emit("FE-existing-participants", {
+        participants: participantsList,
+      })
+    } else {
+      console.log(`No participants found for call ${callId}`)
+      socket.emit("FE-existing-participants", { participants: [] })
+    }
+  })
+
+  socket.on("BE-webrtc-offer", ({ to, offer, callId }) => {
+    try {
+      const currentUser = connectedUsers.get(socket.id)
+      const targetUser = Array.from(connectedUsers.values()).find((u) => u._id === to)
+
+      if (targetUser && currentUser) {
+        console.log(`Forwarding WebRTC offer from ${currentUser.name} to ${targetUser.name} for call ${callId}`)
+        io.to(targetUser.socketId).emit("FE-webrtc-offer", {
+          from: currentUser._id,
+          offer,
+          callId,
+        })
+      } else {
+        console.error(`Could not find target user ${to} for WebRTC offer`)
+      }
+    } catch (error) {
+      console.error("WebRTC offer forwarding error:", error)
+    }
+  })
 
   socket.on("BE-track-state-changed", ({ to, trackType, enabled, callId }) => {
-  try {
-    console.log(`Track state change: ${trackType} = ${enabled} from ${socket.id} to ${to}`)
+    try {
+      console.log(`Track state change: ${trackType} = ${enabled} from ${socket.id} to ${to} for call ${callId}`)
 
-    const targetUser = Array.from(connectedUsers.values()).find((u) => u._id === to)
-    if (targetUser) {
-      io.to(targetUser.socketId).emit("FE-track-state-changed", {
-        from: connectedUsers.get(socket.id)?._id,
-        trackType,
-        enabled,
-        callId,
-      })
+      const currentUser = connectedUsers.get(socket.id)
+      const targetUser = Array.from(connectedUsers.values()).find((u) => u._id === to)
+
+      if (targetUser && currentUser) {
+        io.to(targetUser.socketId).emit("FE-track-state-changed", {
+          from: currentUser._id,
+          trackType,
+          enabled,
+          callId,
+        })
+      } else {
+        console.error(`Could not find target user ${to} for track state change`)
+      }
+    } catch (error) {
+      console.error("Track state change error:", error)
     }
-  } catch (error) {
-    console.error("Track state change error:", error)
-  }
-})
+  })
 
-socket.on("BE-webrtc-answer", ({ to, answer, callId }) => {
-  try {
-    const currentUser = connectedUsers.get(socket.id)
-    const targetUser = Array.from(connectedUsers.values()).find((u) => u._id === to)
+  socket.on("BE-webrtc-answer", ({ to, answer, callId }) => {
+    try {
+      const currentUser = connectedUsers.get(socket.id)
+      const targetUser = Array.from(connectedUsers.values()).find((u) => u._id === to)
 
-    if (targetUser && currentUser) {
-      console.log(`Forwarding WebRTC answer from ${currentUser.name} to ${targetUser.name}`)
-      io.to(targetUser.socketId).emit("FE-webrtc-answer", {
-        from: currentUser._id,
-        answer,
-        callId,
-      })
+      if (targetUser && currentUser) {
+        console.log(`Forwarding WebRTC answer from ${currentUser.name} to ${targetUser.name} for call ${callId}`)
+        io.to(targetUser.socketId).emit("FE-webrtc-answer", {
+          from: currentUser._id,
+          answer,
+          callId,
+        })
+      } else {
+        console.error(`Could not find target user ${to} for WebRTC answer`)
+      }
+    } catch (error) {
+      console.error("WebRTC answer forwarding error:", error)
     }
-  } catch (error) {
-    console.error("WebRTC answer forwarding error:", error)
-  }
-})
+  })
+
   socket.on("BE-webrtc-ice-candidate", ({ to, candidate, callId }) => {
-  try {
-    const currentUser = connectedUsers.get(socket.id)
-    const targetUser = Array.from(connectedUsers.values()).find((u) => u._id === to)
+    try {
+      const currentUser = connectedUsers.get(socket.id)
+      const targetUser = Array.from(connectedUsers.values()).find((u) => u._id === to)
 
-    if (targetUser && currentUser) {
-      io.to(targetUser.socketId).emit("FE-webrtc-ice-candidate", {
-        from: currentUser._id,
-        candidate,
-        callId,
-      })
+      if (targetUser && currentUser) {
+        io.to(targetUser.socketId).emit("FE-webrtc-ice-candidate", {
+          from: currentUser._id,
+          candidate,
+          callId,
+        })
+      } else {
+        console.error(`Could not find target user ${to} for ICE candidate`)
+      }
+    } catch (error) {
+      console.error("ICE candidate forwarding error:", error)
     }
-  } catch (error) {
-    console.error("ICE candidate forwarding error:", error)
-  }
-})
+  })
 
   // Get call history for specific chat
   socket.on("BE-get-chat-call-history", async ({ roomId, isGroupChat, targetUserId, groupId }) => {
@@ -722,38 +1075,79 @@ socket.on("BE-webrtc-answer", ({ to, answer, callId }) => {
     }
   })
 
-  // Handle disconnect
   socket.on("disconnect", async () => {
     console.log("User disconnected:", socket.id)
 
     const user = connectedUsers.get(socket.id)
+
     if (user) {
-      // Update user status to offline
+      // Update user offline
       await User.findByIdAndUpdate(user._id, {
         isOnline: false,
         lastSeen: new Date(),
         socketId: null,
       })
 
-      // End any active calls
+      // active calls
       for (const [callId, call] of activeCalls.entries()) {
-        if (call.caller._id === user._id || call.receiver?._id === user._id) {
-          // End the call
-          await CallHistory.findOneAndUpdate(
-            { callId },
-            {
-              status: "ended",
-              endTime: new Date(),
-            },
-          )
+        if (
+          call.caller._id === user._id ||
+          call.receiver?._id === user._id ||
+          (call.participants && call.participants.includes(user._id))
+        ) {
+          if (call.isGroupCall && call.participants) {
+            call.participants = call.participants.filter((p) => p !== user._id)
 
-          activeCalls.delete(callId)
-          io.to(`call_${callId}`).emit("FE-call-ended", { callId })
+            if (callParticipants.has(callId)) {
+              callParticipants.get(callId).delete(user._id)
+            }
+
+            if (call.participants.length === 0) {
+              if (callTimeouts.has(callId)) {
+                clearTimeout(callTimeouts.get(callId))
+                callTimeouts.delete(callId)
+              }
+
+              await CallHistory.findOneAndUpdate(
+                { callId },
+                {
+                  status: "ended",
+                  endTime: new Date(),
+                },
+              )
+              activeCalls.delete(callId)
+              callParticipants.delete(callId)
+
+              if (call.groupId) {
+                broadcastCallStatus(callId, "ended", call.groupId, call.callType)
+              }
+
+              io.to(`call_${callId}`).emit("FE-call-ended", { callId, groupId: call.groupId })
+            } else {
+              activeCalls.set(callId, call)
+              io.to(`call_${callId}`).emit("FE-user-left-call", { userId: user._id })
+            }
+          } else {
+            // For one-to-one calls, end the call
+            if (callTimeouts.has(callId)) {
+              clearTimeout(callTimeouts.get(callId))
+              callTimeouts.delete(callId)
+            }
+
+            await CallHistory.findOneAndUpdate(
+              { callId },
+              {
+                status: "ended",
+                endTime: new Date(),
+              },
+            )
+            activeCalls.delete(callId)
+            io.to(`call_${callId}`).emit("FE-call-ended", { callId })
+          }
         }
       }
 
       connectedUsers.delete(socket.id)
-
       await broadcastUserList()
     }
   })
@@ -761,6 +1155,6 @@ socket.on("BE-webrtc-answer", ({ to, answer, callId }) => {
 
 const PORT = process.env.PORT || 3001
 server.listen(PORT, () => {
-  dbConnection();
+  dbConnection()
   console.log(`Server running on port ${PORT}`)
 })
