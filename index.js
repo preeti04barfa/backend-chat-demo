@@ -39,6 +39,10 @@ const connectedUsers = new Map()
 const activeCalls = new Map()
 const callParticipants = new Map()
 const callTimeouts = new Map()
+// SFU-specific maps
+const callHubs = new Map() 
+console.log(callHubs,"callHubs");
+
 
 const broadcastUserList = async () => {
   try {
@@ -62,17 +66,48 @@ const broadcastUserList = async () => {
   }
 }
 
-// broadcast call status changes
 const broadcastCallStatus = (callId, status, groupId = null, callType = null) => {
   console.log(`Broadcasting call status: ${callId} -> ${status} (${callType})`)
 
   if (groupId) {
-    // Broadcast to all group members
     io.emit("FE-call-status-changed", { callId, status, groupId, callType })
   } else {
-    // Broadcast to call participants
     io.to(`call_${callId}`).emit("FE-call-status-changed", { callId, status, callType })
   }
+}
+
+const assignCallHub = (callId, participants) => {
+  if (!participants || participants.length === 0) return null
+
+  const callParticipantsList = callParticipants.get(callId)
+  let sortedParticipants
+
+  if (callParticipantsList) {
+    const participantsWithTime = [...participants].filter(
+      (id) => callParticipantsList.has(id) && callParticipantsList.get(id).joinedAt,
+    )
+
+    if (participantsWithTime.length > 0) {
+      sortedParticipants = participantsWithTime.sort((a, b) => {
+        const timeA = callParticipantsList.get(a).joinedAt
+        const timeB = callParticipantsList.get(b).joinedAt
+        return timeA - timeB
+      })
+    } else {
+      sortedParticipants = [...participants].sort()
+    }
+  } else {
+    sortedParticipants = [...participants].sort()
+  }
+
+  const hubUserId = sortedParticipants[0]
+
+  callHubs.set(callId, hubUserId)
+  console.log(`Hub assigned for call ${callId}: ${hubUserId}`)
+
+  io.to(`call_${callId}`).emit("FE-hub-assignment", { hubUserId })
+
+  return hubUserId
 }
 
 io.on("connection", (socket) => {
@@ -463,9 +498,12 @@ io.on("connection", (socket) => {
         ]),
       )
 
+      // Assign the caller as the initial hub for SFU
+      assignCallHub(callId, [currentUser._id])
+
       socket.join(`call_${callId}`)
 
-      // 40-second
+      // 40-second timeout
       const timeout = setTimeout(() => {
         const call = activeCalls.get(callId)
         if (call && call.status === "ringing") {
@@ -482,11 +520,12 @@ io.on("connection", (socket) => {
           activeCalls.delete(callId)
           callParticipants.delete(callId)
           callTimeouts.delete(callId)
+          callHubs.delete(callId)
 
           broadcastCallStatus(callId, "ended", groupId, callType)
           io.to(`call_${callId}`).emit("FE-call-ended", { callId, groupId })
         }
-      }, 40000) 
+      }, 40000)
 
       callTimeouts.set(callId, timeout)
 
@@ -568,6 +607,11 @@ io.on("connection", (socket) => {
           },
         )
 
+        // Check if we need to assign or reassign the hub
+        if (!callHubs.has(callId)) {
+          assignCallHub(callId, call.participants)
+        }
+
         // Notify all participants about the new user joining
         socket.to(`call_${callId}`).emit("FE-user-joined-call", {
           userId: currentUser._id,
@@ -620,6 +664,32 @@ io.on("connection", (socket) => {
     }
   })
 
+  // Hub assignment for SFU architecture
+  socket.on("BE-hub-assignment", ({ callId, hubUserId }) => {
+    try {
+      const currentUser = connectedUsers.get(socket.id)
+      if (!currentUser) return
+
+      const call = activeCalls.get(callId)
+      if (!call || !call.isGroupCall) return
+
+      // Only allow hub assignment from participants
+      if (!call.participants.includes(currentUser._id)) return
+
+      console.log(`Hub assignment request for call ${callId}: ${hubUserId}`)
+
+      // Update the hub
+      callHubs.set(callId, hubUserId)
+
+      // Notify all participants
+      io.to(`call_${callId}`).emit("FE-hub-assignment", { hubUserId })
+
+      console.log(`Hub assigned for call ${callId}: ${hubUserId}`)
+    } catch (error) {
+      console.error("Hub assignment error:", error)
+    }
+  })
+
   //joining active group calls
   socket.on("BE-join-active-call", async ({ callId, groupId, callType }) => {
     try {
@@ -664,6 +734,12 @@ io.on("connection", (socket) => {
           $addToSet: { participants: currentUser._id },
         },
       )
+
+      // Send current hub information to the new participant
+      if (callHubs.has(callId)) {
+        const hubUserId = callHubs.get(callId)
+        socket.emit("FE-hub-assignment", { hubUserId })
+      }
 
       // Notify all participants about the new user joining
       socket.to(`call_${callId}`).emit("FE-user-joined-call", {
@@ -762,6 +838,7 @@ io.on("connection", (socket) => {
 
       activeCalls.delete(callId)
       callParticipants.delete(callId)
+      callHubs.delete(callId)
 
       // Notify all participants
       io.to(`call_${callId}`).emit("FE-call-ended", { callId, groupId: call.groupId })
@@ -812,7 +889,7 @@ io.on("connection", (socket) => {
       if (call.participants) {
         call.participants = call.participants.filter((id) => id !== userId)
 
-        // If no part.. end the call completely
+        // If no participants left, end the call completely
         if (call.participants.length === 0) {
           console.log(`No participants left in call ${callId}, ending call`)
 
@@ -835,6 +912,7 @@ io.on("connection", (socket) => {
 
           activeCalls.delete(callId)
           callParticipants.delete(callId)
+          callHubs.delete(callId)
 
           // Broadcast call ended status
           if (call.groupId) {
@@ -843,6 +921,16 @@ io.on("connection", (socket) => {
 
           io.to(`call_${callId}`).emit("FE-call-ended", { callId, groupId: call.groupId })
         } else {
+          // Check if the hub left and reassign if needed
+          if (callHubs.has(callId) && callHubs.get(callId) === userId) {
+            console.log(`Hub ${userId} left call ${callId}, reassigning hub`)
+
+            // Wait a short time to ensure all leave events are processed
+            setTimeout(() => {
+              assignCallHub(callId, call.participants)
+            }, 500)
+          }
+
           activeCalls.set(callId, call)
         }
       }
@@ -881,6 +969,12 @@ io.on("connection", (socket) => {
         const participant = callParticipants.get(callId).get(userId)
         participant.socketId = socket.id
         participant.rejoinedAt = new Date()
+      }
+
+      // Send current hub information to the joining user
+      if (callHubs.has(callId)) {
+        const hubUserId = callHubs.get(callId)
+        socket.emit("FE-hub-assignment", { hubUserId })
       }
 
       socket.to(`call_${callId}`).emit("FE-user-joined-call", {
@@ -924,6 +1018,12 @@ io.on("connection", (socket) => {
       socket.emit("FE-existing-participants", {
         participants: participantsList,
       })
+
+      // Also send current hub information
+      if (callHubs.has(callId)) {
+        const hubUserId = callHubs.get(callId)
+        socket.emit("FE-hub-assignment", { hubUserId })
+      }
     } else {
       console.log(`No participants found for call ${callId}`)
       socket.emit("FE-existing-participants", { participants: [] })
@@ -1102,6 +1202,14 @@ io.on("connection", (socket) => {
               callParticipants.get(callId).delete(user._id)
             }
 
+            // Check if the hub disconnected
+            if (callHubs.has(callId) && callHubs.get(callId) === user._id) {
+              console.log(`Hub ${user._id} disconnected from call ${callId}, reassigning hub`)
+              if (call.participants.length > 0) {
+                assignCallHub(callId, call.participants)
+              }
+            }
+
             if (call.participants.length === 0) {
               if (callTimeouts.has(callId)) {
                 clearTimeout(callTimeouts.get(callId))
@@ -1117,6 +1225,7 @@ io.on("connection", (socket) => {
               )
               activeCalls.delete(callId)
               callParticipants.delete(callId)
+              callHubs.delete(callId)
 
               if (call.groupId) {
                 broadcastCallStatus(callId, "ended", call.groupId, call.callType)
