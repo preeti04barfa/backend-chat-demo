@@ -38,8 +38,10 @@ const User = require("./src/models/User")
 const connectedUsers = new Map()
 const activeCalls = new Map()
 const callParticipants = new Map()
+console.log(callParticipants,"callParticipants");
+
 const callTimeouts = new Map()
-// SFU-specific maps
+// SFU
 const callHubs = new Map() 
 console.log(callHubs,"callHubs");
 
@@ -77,6 +79,8 @@ const broadcastCallStatus = (callId, status, groupId = null, callType = null) =>
 }
 
 const assignCallHub = (callId, participants) => {
+  console.log(callId, participants,"callId, participants");
+  
   if (!participants || participants.length === 0) return null
 
   const callParticipantsList = callParticipants.get(callId)
