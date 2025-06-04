@@ -2,6 +2,7 @@ const express = require("express")
 const http = require("http")
 const socketIo = require("socket.io")
 const cors = require("cors")
+const mediasoup = require("mediasoup")
 require("dotenv").config()
 
 const app = express()
@@ -35,10 +36,200 @@ const Group = require("./src/models/Group")
 const Chat = require("./src/models/Chat")
 const User = require("./src/models/User")
 
+// Global variables
 const connectedUsers = new Map()
 const activeCalls = new Map()
-const callParticipants = new Map()
 const callTimeouts = new Map()
+
+// mediasoup objects (only for group calls)
+const workers = []
+const numWorkers = Object.keys(require("os").cpus()).length
+const routers = new Map() // callId -> router
+const transports = new Map() // userId_callId -> transport
+const producers = new Map() // userId_callId -> Map(kind -> producer)
+const consumers = new Map() // userId_callId -> Map(producerId -> consumer)
+
+// mediasoup settings
+const mediasoupSettings = {
+  worker: {
+    rtcMinPort: 10000,
+    rtcMaxPort: 10100,
+    logLevel: "warn",
+    logTags: ["info", "ice", "dtls", "rtp", "srtp", "rtcp"],
+  },
+  router: {
+    mediaCodecs: [
+      {
+        kind: "audio",
+        mimeType: "audio/opus",
+        clockRate: 48000,
+        channels: 2,
+      },
+      {
+        kind: "video",
+        mimeType: "video/VP8",
+        clockRate: 90000,
+        parameters: {
+          "x-google-start-bitrate": 1000,
+        },
+      },
+      {
+        kind: "video",
+        mimeType: "video/VP9",
+        clockRate: 90000,
+        parameters: {
+          "profile-id": 2,
+          "x-google-start-bitrate": 1000,
+        },
+      },
+      {
+        kind: "video",
+        mimeType: "video/h264",
+        clockRate: 90000,
+        parameters: {
+          "packetization-mode": 1,
+          "profile-level-id": "4d0032",
+          "level-asymmetry-allowed": 1,
+          "x-google-start-bitrate": 1000,
+        },
+      },
+    ],
+  },
+  webRtcTransport: {
+    listenIps: [
+      {
+        ip: "0.0.0.0",
+        announcedIp: process.env.ANNOUNCED_IP || "127.0.0.1", // Replace with your public IP in production
+      },
+    ],
+    initialAvailableOutgoingBitrate: 1000000,
+    minimumAvailableOutgoingBitrate: 600000,
+    maxSctpMessageSize: 262144,
+    maxIncomingBitrate: 1500000,
+  },
+}
+
+// Initialize mediasoup workers
+async function initializeMediasoupWorkers() {
+  console.log(`Initializing ${numWorkers} mediasoup workers...`)
+
+  for (let i = 0; i < numWorkers; i++) {
+    const worker = await mediasoup.createWorker({
+      logLevel: mediasoupSettings.worker.logLevel,
+      logTags: mediasoupSettings.worker.logTags,
+      rtcMinPort: mediasoupSettings.worker.rtcMinPort,
+      rtcMaxPort: mediasoupSettings.worker.rtcMaxPort,
+    })
+
+    worker.on("died", () => {
+      console.error(`mediasoup worker ${i} died, exiting...`)
+      setTimeout(() => process.exit(1), 2000)
+    })
+
+    workers.push(worker)
+    console.log(`mediasoup worker ${i} initialized`)
+  }
+}
+
+// Get next mediasoup worker (round-robin)
+function getMediasoupWorker() {
+  const worker = workers[nextMediasoupWorkerIdx]
+  nextMediasoupWorkerIdx = (nextMediasoupWorkerIdx + 1) % workers.length
+  return worker
+}
+
+let nextMediasoupWorkerIdx = 0
+
+// Create a mediasoup router for a call
+async function createRouter(callId) {
+  const worker = getMediasoupWorker()
+  const router = await worker.createRouter({ mediaCodecs: mediasoupSettings.router.mediaCodecs })
+  routers.set(callId, router)
+  console.log(`Created router for call ${callId}`)
+  return router
+}
+
+// Create a mediasoup transport
+async function createTransport(router, userId, callId) {
+  const key = `${userId}_${callId}`
+
+  // Check if transport already exists
+  if (transports.has(key)) {
+    console.log(`Transport already exists for user ${userId} in call ${callId}`)
+    const existingTransport = transports.get(key)
+    return {
+      id: existingTransport.id,
+      iceParameters: existingTransport.iceParameters,
+      iceCandidates: existingTransport.iceCandidates,
+      dtlsParameters: existingTransport.dtlsParameters,
+    }
+  }
+
+  const transport = await router.createWebRtcTransport(mediasoupSettings.webRtcTransport)
+
+  // Add connection state tracking
+  transport.isConnected = false
+  transport.isConnecting = false
+
+  // Store transport
+  transports.set(key, transport)
+
+  transport.on("dtlsstatechange", (dtlsState) => {
+    if (dtlsState === "closed") {
+      console.log(`Transport closed for user ${userId} in call ${callId}`)
+      transports.delete(key)
+    } else if (dtlsState === "connected") {
+      transport.isConnected = true
+      transport.isConnecting = false
+    }
+  })
+
+  transport.on("close", () => {
+    console.log(`Transport closed for user ${userId} in call ${callId}`)
+    transports.delete(key)
+  })
+
+  console.log(`Created transport for user ${userId} in call ${callId}`)
+
+  return {
+    id: transport.id,
+    iceParameters: transport.iceParameters,
+    iceCandidates: transport.iceCandidates,
+    dtlsParameters: transport.dtlsParameters,
+  }
+}
+
+// Clean up resources for a call
+function cleanupCall(callId) {
+  // Close router which will close all transports, producers, consumers
+  const router = routers.get(callId)
+  if (router) {
+    router.close()
+    routers.delete(callId)
+  }
+
+  // Clean up maps
+  for (const [key, transport] of transports.entries()) {
+    if (key.endsWith(`_${callId}`)) {
+      transport.close()
+      transports.delete(key)
+    }
+  }
+
+  for (const [key] of producers.entries()) {
+    if (key.endsWith(`_${callId}`)) {
+      producers.delete(key)
+    }
+  }
+
+  for (const [key] of consumers.entries()) {
+    if (key.endsWith(`_${callId}`)) {
+      consumers.delete(key)
+    }
+  }
+
+  console.log(`Cleaned up resources for call ${callId}`)
+}
 
 const broadcastUserList = async () => {
   try {
@@ -443,29 +634,12 @@ io.on("connection", (socket) => {
         participants: [currentUser._id],
       })
 
-      // Initialize call participants
-      callParticipants.set(
-        callId,
-        new Map([
-          [
-            currentUser._id,
-            {
-              userId: currentUser._id,
-              userInfo: {
-                id: currentUser._id,
-                name: currentUser.name,
-                email: currentUser.email,
-              },
-              socketId: socket.id,
-              joinedAt: new Date(),
-            },
-          ],
-        ]),
-      )
+      // Create a mediasoup router for this group call
+      await createRouter(callId)
 
       socket.join(`call_${callId}`)
 
-      // 40-second
+      // 40-second timeout
       const timeout = setTimeout(() => {
         const call = activeCalls.get(callId)
         if (call && call.status === "ringing") {
@@ -480,13 +654,13 @@ io.on("connection", (socket) => {
           ).catch(console.error)
 
           activeCalls.delete(callId)
-          callParticipants.delete(callId)
+          cleanupCall(callId)
           callTimeouts.delete(callId)
 
           broadcastCallStatus(callId, "ended", groupId, callType)
           io.to(`call_${callId}`).emit("FE-call-ended", { callId, groupId })
         }
-      }, 40000) 
+      }, 40000)
 
       callTimeouts.set(callId, timeout)
 
@@ -541,21 +715,6 @@ io.on("connection", (socket) => {
         }
 
         activeCalls.set(callId, call)
-
-        if (!callParticipants.has(callId)) {
-          callParticipants.set(callId, new Map())
-        }
-
-        callParticipants.get(callId).set(currentUser._id, {
-          userId: currentUser._id,
-          userInfo: {
-            id: currentUser._id,
-            name: currentUser.name,
-            email: currentUser.email,
-          },
-          socketId: socket.id,
-          joinedAt: new Date(),
-        })
 
         socket.join(`call_${callId}`)
 
@@ -638,22 +797,6 @@ io.on("connection", (socket) => {
       }
 
       activeCalls.set(callId, call)
-
-      // Add to call participants with detailed info
-      if (!callParticipants.has(callId)) {
-        callParticipants.set(callId, new Map())
-      }
-
-      callParticipants.get(callId).set(currentUser._id, {
-        userId: currentUser._id,
-        userInfo: {
-          id: currentUser._id,
-          name: currentUser.name,
-          email: currentUser.email,
-        },
-        socketId: socket.id,
-        joinedAt: new Date(),
-      })
 
       socket.join(`call_${callId}`)
 
@@ -761,7 +904,11 @@ io.on("connection", (socket) => {
       )
 
       activeCalls.delete(callId)
-      callParticipants.delete(callId)
+
+      // Clean up mediasoup resources for group calls
+      if (call.isGroupCall) {
+        cleanupCall(callId)
+      }
 
       // Notify all participants
       io.to(`call_${callId}`).emit("FE-call-ended", { callId, groupId: call.groupId })
@@ -804,15 +951,38 @@ io.on("connection", (socket) => {
       socket.leave(`call_${callId}`)
       socket.to(`call_${callId}`).emit("FE-user-left-call", { userId })
 
-      if (callParticipants.has(callId)) {
-        callParticipants.get(callId).delete(userId)
-        console.log(`Removed ${userId} from call participants. Remaining: ${callParticipants.get(callId).size}`)
+      // Clean up user's mediasoup resources for group calls
+      if (call.isGroupCall) {
+        const transportKey = `${userId}_${callId}`
+        const transport = transports.get(transportKey)
+        if (transport) {
+          transport.close()
+          transports.delete(transportKey)
+        }
+
+        // Clean up producers
+        if (producers.has(transportKey)) {
+          const userProducers = producers.get(transportKey)
+          for (const producer of userProducers.values()) {
+            producer.close()
+          }
+          producers.delete(transportKey)
+        }
+
+        // Clean up consumers
+        if (consumers.has(transportKey)) {
+          const userConsumers = consumers.get(transportKey)
+          for (const consumer of userConsumers.values()) {
+            consumer.close()
+          }
+          consumers.delete(transportKey)
+        }
       }
 
       if (call.participants) {
         call.participants = call.participants.filter((id) => id !== userId)
 
-        // If no part.. end the call completely
+        // If no participants left, end the call completely
         if (call.participants.length === 0) {
           console.log(`No participants left in call ${callId}, ending call`)
 
@@ -834,7 +1004,10 @@ io.on("connection", (socket) => {
           ).catch(console.error)
 
           activeCalls.delete(callId)
-          callParticipants.delete(callId)
+
+          if (call.isGroupCall) {
+            cleanupCall(callId)
+          }
 
           // Broadcast call ended status
           if (call.groupId) {
@@ -844,6 +1017,7 @@ io.on("connection", (socket) => {
           io.to(`call_${callId}`).emit("FE-call-ended", { callId, groupId: call.groupId })
         } else {
           activeCalls.set(callId, call)
+          io.to(`call_${callId}`).emit("FE-user-left-call", { userId: userId })
         }
       }
     } catch (error) {
@@ -851,163 +1025,337 @@ io.on("connection", (socket) => {
     }
   })
 
-  // WebRTC signaling for group calls
-  socket.on("BE-join-call", ({ callId, userId, userInfo }) => {
-    console.log(`User ${userId} joining call ${callId}`, userInfo)
-
-    socket.join(`call_${callId}`)
-
-    const call = activeCalls.get(callId)
-    if (!call) {
-      console.error(`Call ${callId} not found`)
-      return
-    }
-
-    if (call.isGroupCall) {
-      if (!callParticipants.has(callId)) {
-        callParticipants.set(callId, new Map())
-      }
-
-      if (!callParticipants.get(callId).has(userId)) {
-        callParticipants.get(callId).set(userId, {
-          userId,
-          userInfo: userInfo || { id: userId, name: "User" },
-          socketId: socket.id,
-          joinedAt: new Date(),
-        })
-
-        console.log(`Added ${userId} to call participants. Total participants: ${callParticipants.get(callId).size}`)
-      } else {
-        const participant = callParticipants.get(callId).get(userId)
-        participant.socketId = socket.id
-        participant.rejoinedAt = new Date()
-      }
-
-      socket.to(`call_${callId}`).emit("FE-user-joined-call", {
-        userId,
-        userInfo: userInfo || { id: userId, name: "User" },
-      })
-
-      if (!call.participants) {
-        call.participants = []
-      }
-      if (!call.participants.includes(userId)) {
-        call.participants.push(userId)
-        activeCalls.set(callId, call)
-      }
-    } else {
-      // For one-to-one calls, just notify the other participant
-      socket.to(`call_${callId}`).emit("FE-user-joined-call", {
-        userId,
-        userInfo: userInfo || { id: userId, name: "User" },
-      })
-    }
-  })
-
-  // get existing participants for group calls
-  socket.on("BE-get-call-participants", ({ callId }) => {
-    console.log(`Getting participants for call ${callId}`)
-
-    const participants = callParticipants.get(callId)
-    if (participants) {
-      const participantsList = Array.from(participants.values()).filter((p) => {
-        // Only include participants that are still connected
-        const user = Array.from(connectedUsers.values()).find((u) => u._id === p.userId)
-        return user && user.socketId
-      })
-
-      console.log(
-        `Sending ${participantsList.length} existing participants for call ${callId}:`,
-        participantsList.map((p) => p.userInfo.name || p.userId),
-      )
-
-      socket.emit("FE-existing-participants", {
-        participants: participantsList,
-      })
-    } else {
-      console.log(`No participants found for call ${callId}`)
-      socket.emit("FE-existing-participants", { participants: [] })
-    }
-  })
-
-  socket.on("BE-webrtc-offer", ({ to, offer, callId }) => {
+  // P2P WebRTC handlers (for one-to-one calls)
+  socket.on("BE-webrtc-offer", async ({ to, offer, callId }) => {
     try {
-      const currentUser = connectedUsers.get(socket.id)
-      const targetUser = Array.from(connectedUsers.values()).find((u) => u._id === to)
-
-      if (targetUser && currentUser) {
-        console.log(`Forwarding WebRTC offer from ${currentUser.name} to ${targetUser.name} for call ${callId}`)
-        io.to(targetUser.socketId).emit("FE-webrtc-offer", {
-          from: currentUser._id,
+      const targetUserSocket = Array.from(connectedUsers.values()).find((u) => u._id === to)
+      if (targetUserSocket) {
+        io.to(targetUserSocket.socketId).emit("FE-webrtc-offer", {
+          from: connectedUsers.get(socket.id)._id,
           offer,
           callId,
         })
-      } else {
-        console.error(`Could not find target user ${to} for WebRTC offer`)
       }
     } catch (error) {
-      console.error("WebRTC offer forwarding error:", error)
+      console.error("WebRTC offer error:", error)
     }
   })
 
-  socket.on("BE-track-state-changed", ({ to, trackType, enabled, callId }) => {
+  socket.on("BE-webrtc-answer", async ({ to, answer, callId }) => {
     try {
-      console.log(`Track state change: ${trackType} = ${enabled} from ${socket.id} to ${to} for call ${callId}`)
-
-      const currentUser = connectedUsers.get(socket.id)
-      const targetUser = Array.from(connectedUsers.values()).find((u) => u._id === to)
-
-      if (targetUser && currentUser) {
-        io.to(targetUser.socketId).emit("FE-track-state-changed", {
-          from: currentUser._id,
-          trackType,
-          enabled,
-          callId,
-        })
-      } else {
-        console.error(`Could not find target user ${to} for track state change`)
-      }
-    } catch (error) {
-      console.error("Track state change error:", error)
-    }
-  })
-
-  socket.on("BE-webrtc-answer", ({ to, answer, callId }) => {
-    try {
-      const currentUser = connectedUsers.get(socket.id)
-      const targetUser = Array.from(connectedUsers.values()).find((u) => u._id === to)
-
-      if (targetUser && currentUser) {
-        console.log(`Forwarding WebRTC answer from ${currentUser.name} to ${targetUser.name} for call ${callId}`)
-        io.to(targetUser.socketId).emit("FE-webrtc-answer", {
-          from: currentUser._id,
+      const targetUserSocket = Array.from(connectedUsers.values()).find((u) => u._id === to)
+      if (targetUserSocket) {
+        io.to(targetUserSocket.socketId).emit("FE-webrtc-answer", {
+          from: connectedUsers.get(socket.id)._id,
           answer,
           callId,
         })
-      } else {
-        console.error(`Could not find target user ${to} for WebRTC answer`)
       }
     } catch (error) {
-      console.error("WebRTC answer forwarding error:", error)
+      console.error("WebRTC answer error:", error)
     }
   })
 
-  socket.on("BE-webrtc-ice-candidate", ({ to, candidate, callId }) => {
+  socket.on("BE-webrtc-ice-candidate", async ({ to, candidate, callId }) => {
     try {
-      const currentUser = connectedUsers.get(socket.id)
-      const targetUser = Array.from(connectedUsers.values()).find((u) => u._id === to)
-
-      if (targetUser && currentUser) {
-        io.to(targetUser.socketId).emit("FE-webrtc-ice-candidate", {
-          from: currentUser._id,
+      const targetUserSocket = Array.from(connectedUsers.values()).find((u) => u._id === to)
+      if (targetUserSocket) {
+        io.to(targetUserSocket.socketId).emit("FE-webrtc-ice-candidate", {
+          from: connectedUsers.get(socket.id)._id,
           candidate,
           callId,
         })
-      } else {
-        console.error(`Could not find target user ${to} for ICE candidate`)
       }
     } catch (error) {
-      console.error("ICE candidate forwarding error:", error)
+      console.error("WebRTC ICE candidate error:", error)
+    }
+  })
+
+  // mediasoup handlers (for group calls only)
+  socket.on("BE-get-router-rtpCapabilities", async ({ callId }) => {
+    try {
+      const router = routers.get(callId)
+      if (!router) {
+        socket.emit("FE-error", { message: "Call router not found" })
+        return
+      }
+
+      socket.emit("FE-router-rtpCapabilities", {
+        rtpCapabilities: router.rtpCapabilities,
+      })
+    } catch (error) {
+      console.error("Error getting router RTP capabilities:", error)
+      socket.emit("FE-error", { message: "Failed to get router capabilities" })
+    }
+  })
+
+  socket.on("BE-create-transport", async ({ callId, direction }) => {
+    try {
+      const currentUser = connectedUsers.get(socket.id)
+      if (!currentUser) return
+
+      const router = routers.get(callId)
+      if (!router) {
+        socket.emit("FE-error", { message: "Call router not found" })
+        return
+      }
+
+      const key = `${currentUser._id}_${callId}`
+
+      // Check if transport already exists for this user and call
+      if (transports.has(key)) {
+        console.log(`Transport already exists for user ${currentUser._id} in call ${callId}`)
+        const existingTransport = transports.get(key)
+
+        socket.emit("FE-transport-created", {
+          direction,
+          transport: {
+            id: existingTransport.id,
+            iceParameters: existingTransport.iceParameters,
+            iceCandidates: existingTransport.iceCandidates,
+            dtlsParameters: existingTransport.dtlsParameters,
+          },
+        })
+        return
+      }
+
+      const transport = await createTransport(router, currentUser._id, callId)
+
+      socket.emit("FE-transport-created", {
+        direction,
+        transport,
+      })
+    } catch (error) {
+      console.error("Error creating transport:", error)
+      socket.emit("FE-error", { message: "Failed to create transport: " + error.message })
+    }
+  })
+
+  socket.on("BE-connect-transport", async ({ callId, transportId, dtlsParameters }) => {
+    try {
+      const currentUser = connectedUsers.get(socket.id)
+      if (!currentUser) return
+
+      const key = `${currentUser._id}_${callId}`
+      const transport = transports.get(key)
+
+      if (!transport) {
+        socket.emit("FE-error", { message: "Transport not found" })
+        return
+      }
+
+      // Check if transport is already connected or connecting
+      if (transport.isConnected) {
+        console.log(`Transport already connected for user ${currentUser._id}`)
+        socket.emit("FE-transport-connected", { transportId })
+        return
+      }
+
+      if (transport.isConnecting) {
+        console.log(`Transport already connecting for user ${currentUser._id}`)
+        return
+      }
+
+      // Mark as connecting to prevent duplicate calls
+      transport.isConnecting = true
+
+      try {
+        await transport.connect({ dtlsParameters })
+        transport.isConnected = true
+        transport.isConnecting = false
+        console.log(`Transport connected successfully for user ${currentUser._id}`)
+        socket.emit("FE-transport-connected", { transportId })
+      } catch (error) {
+        transport.isConnecting = false
+        throw error
+      }
+    } catch (error) {
+      console.error("Error connecting transport:", error)
+      socket.emit("FE-error", { message: "Failed to connect transport: " + error.message })
+    }
+  })
+
+  socket.on("BE-produce", async ({ callId, transportId, kind, rtpParameters, appData }) => {
+    try {
+      const currentUser = connectedUsers.get(socket.id)
+      if (!currentUser) return
+
+      const key = `${currentUser._id}_${callId}`
+      const transport = transports.get(key)
+
+      if (!transport) {
+        socket.emit("FE-error", { message: "Transport not found" })
+        return
+      }
+
+      const producer = await transport.produce({
+        kind,
+        rtpParameters,
+        appData: { ...appData, userId: currentUser._id },
+      })
+
+      // Store producer
+      if (!producers.has(key)) {
+        producers.set(key, new Map())
+      }
+      producers.get(key).set(kind, producer)
+
+      producer.on("transportclose", () => {
+        console.log(`Producer transport closed for user ${currentUser._id}`)
+        producer.close()
+      })
+
+      // Notify clients about new producer
+      socket.to(`call_${callId}`).emit("FE-new-producer", {
+        producerId: producer.id,
+        userId: currentUser._id,
+        kind,
+      })
+
+      socket.emit("FE-producer-created", {
+        id: producer.id,
+      })
+
+      // Notify about track state
+      socket.to(`call_${callId}`).emit("FE-track-state-changed", {
+        from: currentUser._id,
+        trackType: kind,
+        enabled: true,
+      })
+    } catch (error) {
+      console.error("Error producing:", error)
+      socket.emit("FE-error", { message: "Failed to produce media" })
+    }
+  })
+
+  socket.on("BE-consume", async ({ callId, producerId, rtpCapabilities }) => {
+    try {
+      const currentUser = connectedUsers.get(socket.id)
+      if (!currentUser) return
+
+      const router = routers.get(callId)
+      if (!router) {
+        socket.emit("FE-error", { message: "Call router not found" })
+        return
+      }
+
+      // Check if consumer can consume this producer
+      if (!router.canConsume({ producerId, rtpCapabilities })) {
+        socket.emit("FE-error", { message: "Cannot consume this producer" })
+        return
+      }
+
+      // Find the transport for this user
+      const key = `${currentUser._id}_${callId}`
+      const transport = transports.get(key)
+
+      if (!transport) {
+        socket.emit("FE-error", { message: "Transport not found" })
+        return
+      }
+
+      // Create consumer
+      const consumer = await transport.consume({
+        producerId,
+        rtpCapabilities,
+        paused: true, // Start paused, client will resume
+      })
+
+      // Store consumer
+      if (!consumers.has(key)) {
+        consumers.set(key, new Map())
+      }
+      consumers.get(key).set(producerId, consumer)
+
+      consumer.on("transportclose", () => {
+        console.log(`Consumer transport closed for user ${currentUser._id}`)
+        consumer.close()
+      })
+
+      // Find producer owner
+      let producerUserId = null
+      for (const [userKey, userProducers] of producers.entries()) {
+        for (const [kind, producer] of userProducers.entries()) {
+          if (producer.id === producerId) {
+            producerUserId = userKey.split("_")[0]
+            break
+          }
+        }
+        if (producerUserId) break
+      }
+
+      socket.emit("FE-consumer-created", {
+        id: consumer.id,
+        producerId,
+        kind: consumer.kind,
+        rtpParameters: consumer.rtpParameters,
+        producerUserId,
+      })
+    } catch (error) {
+      console.error("Error consuming:", error)
+      socket.emit("FE-error", { message: "Failed to consume media" })
+    }
+  })
+
+  socket.on("BE-resume-consumer", async ({ callId, consumerId }) => {
+    try {
+      const currentUser = connectedUsers.get(socket.id)
+      if (!currentUser) return
+
+      const key = `${currentUser._id}_${callId}`
+
+      if (!consumers.has(key)) {
+        socket.emit("FE-error", { message: "No consumers found for this user" })
+        return
+      }
+
+      // Find the consumer
+      let consumer = null
+      for (const c of consumers.get(key).values()) {
+        if (c.id === consumerId) {
+          consumer = c
+          break
+        }
+      }
+
+      if (!consumer) {
+        socket.emit("FE-error", { message: "Consumer not found" })
+        return
+      }
+
+      await consumer.resume()
+      socket.emit("FE-consumer-resumed", { consumerId })
+    } catch (error) {
+      console.error("Error resuming consumer:", error)
+      socket.emit("FE-error", { message: "Failed to resume consumer" })
+    }
+  })
+
+  socket.on("BE-track-state-changed", async ({ callId, trackType, enabled, to }) => {
+    try {
+      const currentUser = connectedUsers.get(socket.id)
+      if (!currentUser) return
+
+      // For group calls, notify all participants
+      if (callId) {
+        socket.to(`call_${callId}`).emit("FE-track-state-changed", {
+          from: currentUser._id,
+          trackType,
+          enabled,
+        })
+      } else if (to) {
+        // For one-to-one calls, notify the specific participant
+        const otherUserSocket = Array.from(connectedUsers.values()).find((u) => u._id === to)
+        if (otherUserSocket) {
+          io.to(otherUserSocket.socketId).emit("FE-track-state-changed", {
+            from: currentUser._id,
+            trackType,
+            enabled,
+          })
+        }
+      }
+    } catch (error) {
+      console.error("Track state change error:", error)
     }
   })
 
@@ -1088,7 +1436,7 @@ io.on("connection", (socket) => {
         socketId: null,
       })
 
-      // active calls
+      // Handle active calls
       for (const [callId, call] of activeCalls.entries()) {
         if (
           call.caller._id === user._id ||
@@ -1098,8 +1446,30 @@ io.on("connection", (socket) => {
           if (call.isGroupCall && call.participants) {
             call.participants = call.participants.filter((p) => p !== user._id)
 
-            if (callParticipants.has(callId)) {
-              callParticipants.get(callId).delete(user._id)
+            // Clean up user's mediasoup resources
+            const transportKey = `${user._id}_${callId}`
+            const transport = transports.get(transportKey)
+            if (transport) {
+              transport.close()
+              transports.delete(transportKey)
+            }
+
+            // Clean up producers
+            if (producers.has(transportKey)) {
+              const userProducers = producers.get(transportKey)
+              for (const producer of userProducers.values()) {
+                producer.close()
+              }
+              producers.delete(transportKey)
+            }
+
+            // Clean up consumers
+            if (consumers.has(transportKey)) {
+              const userConsumers = consumers.get(transportKey)
+              for (const consumer of userConsumers.values()) {
+                consumer.close()
+              }
+              consumers.delete(transportKey)
             }
 
             if (call.participants.length === 0) {
@@ -1116,7 +1486,7 @@ io.on("connection", (socket) => {
                 },
               )
               activeCalls.delete(callId)
-              callParticipants.delete(callId)
+              cleanupCall(callId)
 
               if (call.groupId) {
                 broadcastCallStatus(callId, "ended", call.groupId, call.callType)
@@ -1154,7 +1524,16 @@ io.on("connection", (socket) => {
 })
 
 const PORT = process.env.PORT || 3001
-server.listen(PORT, () => {
-  dbConnection()
-  console.log(`Server running on port ${PORT}`)
-})
+
+// Initialize mediasoup workers before starting the server
+initializeMediasoupWorkers()
+  .then(() => {
+    server.listen(PORT, () => {
+      dbConnection()
+      console.log(`Server running on port ${PORT} with ${workers.length} mediasoup workers`)
+    })
+  })
+  .catch((error) => {
+    console.error("Failed to initialize mediasoup workers:", error)
+    process.exit(1)
+  })
